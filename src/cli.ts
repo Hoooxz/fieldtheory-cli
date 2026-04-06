@@ -50,6 +50,14 @@ function friendlyStopReason(raw?: string): string {
   return FRIENDLY_STOP_REASONS[raw] ?? `Sync complete \u2014 ${raw}`;
 }
 
+function warnIfEmpty(totalBookmarks: number): void {
+  if (totalBookmarks > 0) return;
+  console.log(`  \u26a0 No bookmarks were found. This usually means:`);
+  console.log(`    \u2022 Chrome needs to be fully quit first (Cmd+Q, not just closing the window)`);
+  console.log(`    \u2022 Keychain access was denied \u2014 check System Settings \u2192 Privacy & Security`);
+  console.log(`    \u2022 You may be logged into a different Chrome profile than the one with X/Twitter\n`);
+}
+
 const LOGO = `
    \x1b[2m\u250c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2510\x1b[0m
    \x1b[2m\u2502\x1b[0m  \x1b[1mF i e l d   T h e o r y\x1b[0m    \x1b[2m\u2502\x1b[0m
@@ -250,6 +258,7 @@ export function buildCli() {
           });
           console.log(`\n  \u2713 ${result.added} new bookmarks synced (${result.totalBookmarks} total)`);
           console.log(`  \u2713 Data: ${dataDir()}\n`);
+          warnIfEmpty(result.totalBookmarks);
           const newCount = await rebuildIndex(result.added);
           if (options.classify && newCount > 0) {
             await classifyNew();
@@ -273,6 +282,8 @@ export function buildCli() {
           console.log(`\n  \u2713 ${result.added} new bookmarks synced (${result.totalBookmarks} total)`);
           console.log(`  ${friendlyStopReason(result.stopReason)}`);
           console.log(`  \u2713 Data: ${dataDir()}\n`);
+
+          warnIfEmpty(result.totalBookmarks);
 
           const newCount = await rebuildIndex(result.added);
           if (options.classify && newCount > 0) {
