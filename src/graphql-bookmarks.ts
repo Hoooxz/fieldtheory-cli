@@ -2,8 +2,10 @@ import { ensureDir, readJsonLines, writeJsonLines, readJson, writeJson, pathExis
 import { ensureDataDir, twitterBookmarksCachePath, twitterBookmarksMetaPath, twitterBackfillStatePath } from './paths.js';
 import { loadChromeSessionConfig } from './config.js';
 import { extractChromeXCookies } from './chrome-cookies.js';
-import type { BookmarkBackfillState, BookmarkCacheMeta, BookmarkRecord } from './types.js';
-import { exportBookmarksForSyncSeed } from './bookmarks-db.js';
+import type { BookmarkBackfillState, BookmarkCacheMeta, BookmarkRecord, QuotedTweetSnapshot } from './types.js';
+import { exportBookmarksForSyncSeed, updateQuotedTweets, updateBookmarkedAt } from './bookmarks-db.js';
+
+const CHROME_UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36';
 
 const X_PUBLIC_BEARER =
   'AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA';
@@ -146,7 +148,7 @@ function buildHeaders(csrfToken: string, cookieHeader?: string): Record<string, 
     'x-twitter-auth-type': 'OAuth2Session',
     'x-twitter-active-user': 'yes',
     'content-type': 'application/json',
-    'user-agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36',
+    'user-agent': CHROME_UA,
     cookie: cookieHeader ?? `ct0=${csrfToken}`,
   };
 }
@@ -213,6 +215,38 @@ export function convertTweetToRecord(tweetResult: any, now: string): BookmarkRec
     .map((u: any) => u.expanded_url)
     .filter((u: string | undefined) => u && !u.includes('t.co'));
 
+  // Extract quoted tweet if present
+  const quotedResult = tweet?.quoted_status_result?.result;
+  let quotedTweet: BookmarkRecord['quotedTweet'] | undefined;
+  if (quotedResult) {
+    const qtTweet = quotedResult.tweet ?? quotedResult;
+    const qtLegacy = qtTweet?.legacy;
+    if (qtLegacy) {
+      const qtId = qtLegacy.id_str ?? qtTweet?.rest_id;
+      const qtUser = qtTweet?.core?.user_results?.result;
+      const qtHandle = qtUser?.core?.screen_name ?? qtUser?.legacy?.screen_name;
+      const qtMediaEntities = qtLegacy?.extended_entities?.media ?? qtLegacy?.entities?.media ?? [];
+      quotedTweet = {
+        id: qtId,
+        text: qtLegacy.full_text ?? qtLegacy.text ?? '',
+        authorHandle: qtHandle,
+        authorName: qtUser?.core?.name ?? qtUser?.legacy?.name,
+        authorProfileImageUrl:
+          qtUser?.avatar?.image_url ?? qtUser?.legacy?.profile_image_url_https,
+        postedAt: qtLegacy.created_at ?? null,
+        media: qtMediaEntities.map((m: any) => m.media_url_https ?? m.media_url).filter(Boolean),
+        mediaObjects: qtMediaEntities.map((m: any) => ({
+          type: m.type,
+          url: m.media_url_https ?? m.media_url,
+          expandedUrl: m.expanded_url,
+          width: m.original_info?.width,
+          height: m.original_info?.height,
+        })),
+        url: `https://x.com/${qtHandle ?? '_'}/status/${qtId}`,
+      };
+    }
+  }
+
   return {
     id: tweetId,
     tweetId,
@@ -229,6 +263,7 @@ export function convertTweetToRecord(tweetResult: any, now: string): BookmarkRec
     inReplyToStatusId: legacy.in_reply_to_status_id_str,
     inReplyToUserId: legacy.in_reply_to_user_id_str,
     quotedStatusId: legacy.quoted_status_id_str,
+    quotedTweet,
     language: legacy.lang,
     sourceApp: legacy.source,
     possiblySensitive: legacy.possibly_sensitive,
@@ -246,6 +281,19 @@ export function convertTweetToRecord(tweetResult: any, now: string): BookmarkRec
     tags: [],
     ingestedVia: 'graphql',
   };
+}
+
+const TWITTER_SNOWFLAKE_EPOCH = 1288834974657n;
+
+function snowflakeToIso(snowflake: string): string | null {
+  try {
+    const id = BigInt(snowflake);
+    const ms = Number(id >> 22n) + Number(TWITTER_SNOWFLAKE_EPOCH);
+    const date = new Date(ms);
+    return Number.isFinite(date.getTime()) ? date.toISOString() : null;
+  } catch {
+    return null;
+  }
 }
 
 export function parseBookmarksResponse(json: any, now?: string): PageResult {
@@ -271,7 +319,13 @@ export function parseBookmarksResponse(json: any, now?: string): PageResult {
     if (!tweetResult) continue;
 
     const record = convertTweetToRecord(tweetResult, ts);
-    if (record) records.push(record);
+    if (record) {
+      // Extract bookmarkedAt from the entry's sortIndex (snowflake timestamp)
+      if (entry.sortIndex) {
+        record.bookmarkedAt = snowflakeToIso(entry.sortIndex) ?? record.bookmarkedAt;
+      }
+      records.push(record);
+    }
   }
 
   return { records, nextCursor };
@@ -504,4 +558,142 @@ export async function syncBookmarksGraphQL(
   });
 
   return { added: totalAdded, totalBookmarks: existing.length, pages: page, stopReason, cachePath, statePath };
+}
+
+// ── Gap-fill: backfill missing data for existing bookmarks ────────────
+
+const SYNDICATION_URL = 'https://cdn.syndication.twimg.com/tweet-result';
+
+async function fetchTweetViaSyndication(tweetId: string): Promise<QuotedTweetSnapshot | null> {
+  for (let attempt = 0; attempt < 4; attempt++) {
+    const response = await fetch(`${SYNDICATION_URL}?id=${tweetId}&token=x`, {
+      headers: {
+        'user-agent': CHROME_UA,
+      },
+    });
+
+    if (response.ok) {
+      const data = await response.json() as any;
+      if (!data?.text) return null;
+      const handle = data.user?.screen_name;
+      const mediaEntities: any[] = data.mediaDetails ?? [];
+      return {
+        id: String(data.id_str ?? tweetId),
+        text: data.text,
+        authorHandle: handle,
+        authorName: data.user?.name,
+        authorProfileImageUrl: data.user?.profile_image_url_https,
+        postedAt: data.created_at ?? null,
+        media: mediaEntities.map((m: any) => m.media_url_https ?? m.media_url).filter(Boolean),
+        mediaObjects: mediaEntities.map((m: any) => ({
+          type: m.type,
+          url: m.media_url_https ?? m.media_url,
+          width: m.original_info?.width,
+          height: m.original_info?.height,
+        })),
+        url: `https://x.com/${handle ?? '_'}/status/${data.id_str ?? tweetId}`,
+      };
+    }
+
+    if (response.status === 429) {
+      await new Promise((r) => setTimeout(r, Math.min(15 * Math.pow(2, attempt), 120) * 1000));
+      continue;
+    }
+    if (response.status >= 500) {
+      await new Promise((r) => setTimeout(r, 5000 * (attempt + 1)));
+      continue;
+    }
+    // 404/403 — tweet unavailable, don't retry
+    return null;
+  }
+  return null;
+}
+
+export interface GapFillProgress {
+  done: number;
+  total: number;
+  quotedFetched: number;
+  bookmarkedAtFilled: number;
+  failed: number;
+}
+
+export interface GapFillResult {
+  quotedTweetsFilled: number;
+  bookmarkedAtFilled: number;
+  failed: number;
+  total: number;
+}
+
+export async function syncGaps(options?: {
+  onProgress?: (progress: GapFillProgress) => void;
+  delayMs?: number;
+}): Promise<GapFillResult> {
+  const delayMs = options?.delayMs ?? 300;
+  const cachePath = twitterBookmarksCachePath();
+  const records = await readJsonLines<BookmarkRecord>(cachePath);
+
+  // Find bookmarks missing quoted tweets
+  const needsQuotedTweet = records.filter((r) => r.quotedStatusId && !r.quotedTweet);
+  const uniqueQuotedIds = [...new Set(needsQuotedTweet.map((r) => r.quotedStatusId!))];
+
+  // Find bookmarks missing bookmarkedAt (can't backfill via syndication — only from timeline)
+  const needsBookmarkedAt = records.filter((r) => !r.bookmarkedAt);
+
+  const total = uniqueQuotedIds.length;
+  let quotedFetched = 0;
+  let failed = 0;
+
+  const quotedIdToSnapshot = new Map<string, QuotedTweetSnapshot | null>();
+
+  for (let i = 0; i < uniqueQuotedIds.length; i++) {
+    const quotedId = uniqueQuotedIds[i];
+    try {
+      const snapshot = await fetchTweetViaSyndication(quotedId);
+      quotedIdToSnapshot.set(quotedId, snapshot);
+      if (snapshot) quotedFetched++;
+      else failed++;
+    } catch {
+      quotedIdToSnapshot.set(quotedId, null);
+      failed++;
+    }
+
+    options?.onProgress?.({
+      done: i + 1,
+      total,
+      quotedFetched,
+      bookmarkedAtFilled: 0,
+      failed,
+    });
+
+    if (i < uniqueQuotedIds.length - 1) {
+      await new Promise((r) => setTimeout(r, delayMs));
+    }
+  }
+
+  // Apply quoted tweet snapshots to records
+  const dbQuotedUpdates: Array<{ id: string; quotedTweet: QuotedTweetSnapshot }> = [];
+  for (const record of records) {
+    if (record.quotedStatusId && !record.quotedTweet) {
+      const snapshot = quotedIdToSnapshot.get(record.quotedStatusId);
+      if (snapshot) {
+        record.quotedTweet = snapshot;
+        dbQuotedUpdates.push({ id: record.id, quotedTweet: snapshot });
+      }
+    }
+  }
+
+  // Write updated JSONL cache
+  await writeJsonLines(cachePath, records);
+
+  // Update SQLite
+  if (dbQuotedUpdates.length > 0) {
+    await updateQuotedTweets(dbQuotedUpdates);
+  }
+
+  return {
+    quotedTweetsFilled: dbQuotedUpdates.length,
+    bookmarkedAtFilled: needsBookmarkedAt.length, // reported for awareness — filled on next sync
+    failed,
+    total,
+  };
 }

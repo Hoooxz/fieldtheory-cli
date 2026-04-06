@@ -3,8 +3,8 @@ import { Command } from 'commander';
 import { syncTwitterBookmarks } from './bookmarks.js';
 import { getBookmarkStatusView, formatBookmarkStatus } from './bookmarks-service.js';
 import { runTwitterOAuthFlow } from './xauth.js';
-import { syncBookmarksGraphQL } from './graphql-bookmarks.js';
-import type { SyncProgress } from './graphql-bookmarks.js';
+import { syncBookmarksGraphQL, syncGaps } from './graphql-bookmarks.js';
+import type { SyncProgress, GapFillProgress } from './graphql-bookmarks.js';
 import { fetchBookmarkMediaBatch } from './bookmark-media.js';
 import {
   buildIndex,
@@ -23,6 +23,8 @@ import { classifyWithLlm, classifyDomainsWithLlm } from './bookmark-classify-llm
 import { renderViz } from './bookmarks-viz.js';
 import { dataDir, ensureDataDir, isFirstRun, twitterBookmarksIndexPath } from './paths.js';
 import fs from 'node:fs';
+import path from 'node:path';
+import { createRequire } from 'node:module';
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -56,6 +58,61 @@ function warnIfEmpty(totalBookmarks: number): void {
   console.log(`    \u2022 Chrome needs to be fully quit first (Cmd+Q, not just closing the window)`);
   console.log(`    \u2022 Keychain access was denied \u2014 check System Settings \u2192 Privacy & Security`);
   console.log(`    \u2022 You may be logged into a different Chrome profile than the one with X/Twitter\n`);
+}
+
+// ── Update checker ────────────────────────────────────────────────────────
+
+const UPDATE_CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000; // 1 day
+
+function getLocalVersion(): string {
+  try {
+    const require = createRequire(import.meta.url);
+    const pkg = require('../package.json');
+    return pkg.version;
+  } catch {
+    return '0.0.0';
+  }
+}
+
+function compareVersions(a: string, b: string): number {
+  const pa = a.split('.').map(Number);
+  const pb = b.split('.').map(Number);
+  for (let i = 0; i < 3; i++) {
+    if ((pa[i] ?? 0) !== (pb[i] ?? 0)) return (pa[i] ?? 0) - (pb[i] ?? 0);
+  }
+  return 0;
+}
+
+async function checkForUpdate(): Promise<void> {
+  try {
+    const cacheFile = path.join(dataDir(), '.update-check');
+    // Skip if checked recently
+    try {
+      const stat = fs.statSync(cacheFile);
+      if (Date.now() - stat.mtimeMs < UPDATE_CHECK_INTERVAL_MS) return;
+    } catch { /* file doesn't exist, proceed */ }
+
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 5000);
+    const res = await fetch('https://registry.npmjs.org/fieldtheory/latest', {
+      signal: controller.signal,
+      headers: { accept: 'application/json' },
+    });
+    clearTimeout(timeout);
+
+    if (!res.ok) return;
+    const data = await res.json() as any;
+    const latest = data?.version;
+    if (!latest) return;
+
+    // Touch the cache file regardless of result
+    fs.writeFileSync(cacheFile, latest);
+
+    const local = getLocalVersion();
+    if (compareVersions(latest, local) > 0) {
+      console.log(`\n  \u2728 Update available: ${local} \u2192 ${latest}  \u2014  npm update -g fieldtheory`);
+    }
+  } catch { /* network error, offline, etc — silently skip */ }
 }
 
 const LOGO = `
@@ -235,7 +292,8 @@ export function buildCli() {
     .command('sync')
     .description('Sync bookmarks from X into your local database')
     .option('--api', 'Use OAuth v2 API instead of Chrome session', false)
-    .option('--full', 'Full crawl instead of incremental sync', false)
+    .option('--rebuild', 'Full re-crawl of all bookmarks', false)
+    .option('--gaps', 'Backfill missing data (quoted tweets, bookmark dates)', false)
     .option('--classify', 'Classify new bookmarks with LLM after syncing', false)
     .option('--max-pages <n>', 'Max pages to fetch', (v: string) => Number(v), 500)
     .option('--target-adds <n>', 'Stop after N new bookmarks', (v: string) => Number(v))
@@ -249,8 +307,40 @@ export function buildCli() {
       ensureDataDir();
 
       try {
+        if (options.rebuild && options.gaps) {
+          console.error('  Error: --rebuild and --gaps cannot be used together.');
+          process.exitCode = 1;
+          return;
+        }
+
+        // ── gaps mode: backfill missing data for existing bookmarks ──
+        if (options.gaps) {
+          const startTime = Date.now();
+          process.stderr.write('  Filling gaps (quoted tweets, bookmark dates)...\n');
+          const result = await syncGaps({
+            delayMs: Number(options.delayMs) || 300,
+            onProgress: (progress: GapFillProgress) => {
+              const pct = progress.total > 0 ? Math.round((progress.done / progress.total) * 100) : 0;
+              const elapsed = Math.round((Date.now() - startTime) / 1000);
+              const spin = SPINNER[spinnerIdx++ % SPINNER.length];
+              process.stderr.write(`\r\x1b[K  ${spin} ${progress.done}/${progress.total} (${pct}%) \u2502 ${progress.quotedFetched} quoted tweets \u2502 ${progress.failed} unavailable \u2502 ${elapsed}s`);
+            },
+          });
+          process.stderr.write('\n');
+          if (result.total === 0) {
+            console.log('  No gaps found \u2014 all bookmarks are fully enriched.');
+          } else {
+            console.log(`  \u2713 ${result.quotedTweetsFilled} quoted tweets filled`);
+            if (result.failed > 0) console.log(`  ${result.failed} unavailable (deleted or private)`);
+            if (result.bookmarkedAtFilled > 0) {
+              console.log(`  ${result.bookmarkedAtFilled} bookmarks missing bookmark date \u2014 run ft sync to fill`);
+            }
+          }
+          return;
+        }
+
         const useApi = Boolean(options.api);
-        const mode = Boolean(options.full) ? 'full' : 'incremental';
+        const mode = Boolean(options.rebuild) ? 'full' : 'incremental';
 
         if (useApi) {
           const result = await syncTwitterBookmarks(mode, {
@@ -266,7 +356,7 @@ export function buildCli() {
         } else {
           const startTime = Date.now();
           const result = await syncBookmarksGraphQL({
-            incremental: !Boolean(options.full),
+            incremental: !Boolean(options.rebuild),
             maxPages: Number(options.maxPages) || 500,
             targetAdds: typeof options.targetAdds === 'number' && !Number.isNaN(options.targetAdds) ? options.targetAdds : undefined,
             delayMs: Number(options.delayMs) || 600,
@@ -302,6 +392,8 @@ export function buildCli() {
           console.log(`\n  You can also just tell Claude to use the ft CLI to search and`);
           console.log(`  explore your bookmarks. It already knows how.\n`);
         }
+
+        await checkForUpdate();
       } catch (err) {
         const msg = (err as Error).message;
         if (firstRun && (msg.includes('cookie') || msg.includes('Cookie') || msg.includes('Keychain'))) {

@@ -217,6 +217,103 @@ test('convertTweetToRecord: handles tweet with no user results', () => {
   assert.equal(result.url, 'https://x.com/_/status/999');
 });
 
+test('convertTweetToRecord: extracts quoted tweet snapshot', () => {
+  const tr = makeTweetResult({
+    legacy: { quoted_status_id_str: '5555555' },
+    tweet: {
+      quoted_status_result: {
+        result: {
+          rest_id: '5555555',
+          legacy: {
+            id_str: '5555555',
+            full_text: 'This is the quoted tweet text',
+            created_at: 'Mon Mar 09 10:00:00 +0000 2026',
+            entities: { urls: [] },
+            extended_entities: {
+              media: [{
+                type: 'photo',
+                media_url_https: 'https://pbs.twimg.com/media/quoted.jpg',
+                expanded_url: 'https://x.com/quoteduser/status/5555555/photo/1',
+                original_info: { width: 800, height: 600 },
+              }],
+            },
+          },
+          core: {
+            user_results: {
+              result: {
+                rest_id: '6666',
+                core: { screen_name: 'quoteduser', name: 'Quoted User' },
+                avatar: { image_url: 'https://pbs.twimg.com/profile_images/6666/qt.jpg' },
+                legacy: {},
+              },
+            },
+          },
+        },
+      },
+    },
+  });
+  const result = convertTweetToRecord(tr, NOW);
+  assert.ok(result);
+  assert.equal(result.quotedStatusId, '5555555');
+  assert.ok(result.quotedTweet);
+  assert.equal(result.quotedTweet!.id, '5555555');
+  assert.equal(result.quotedTweet!.text, 'This is the quoted tweet text');
+  assert.equal(result.quotedTweet!.authorHandle, 'quoteduser');
+  assert.equal(result.quotedTweet!.url, 'https://x.com/quoteduser/status/5555555');
+  assert.equal(result.quotedTweet!.media?.length, 1);
+});
+
+test('convertTweetToRecord: handles missing quoted tweet gracefully', () => {
+  const tr = makeTweetResult({
+    legacy: { quoted_status_id_str: '7777777' },
+  });
+  const result = convertTweetToRecord(tr, NOW);
+  assert.ok(result);
+  assert.equal(result.quotedStatusId, '7777777');
+  assert.equal(result.quotedTweet, undefined);
+});
+
+test('parseBookmarksResponse: extracts bookmarkedAt from sortIndex', () => {
+  const tr = makeTweetResult();
+  // Snowflake for a known date: encode March 10 2026 00:00:00 UTC
+  // Twitter epoch: 1288834974657, target ms: 1773187200000
+  // offset = 1773187200000 - 1288834974657 = 484352225343
+  // snowflake = offset << 22 = 484352225343 * 4194304 = 2031116076166176768
+  const resp = {
+    data: {
+      bookmark_timeline_v2: {
+        timeline: {
+          instructions: [{
+            type: 'TimelineAddEntries',
+            entries: [{
+              entryId: 'tweet-0',
+              sortIndex: '2031116076166176768',
+              content: {
+                itemContent: { tweet_results: { result: tr } },
+              },
+            }],
+          }],
+        },
+      },
+    },
+  };
+  const { records } = parseBookmarksResponse(resp, NOW);
+  assert.equal(records.length, 1);
+  assert.ok(records[0].bookmarkedAt);
+  // Should decode to approximately March 10 2026
+  const parsed = new Date(records[0].bookmarkedAt!);
+  assert.ok(parsed.getFullYear() === 2026);
+  assert.ok(parsed.getMonth() === 2); // March = month 2
+});
+
+test('parseBookmarksResponse: handles missing sortIndex gracefully', () => {
+  const tr = makeTweetResult();
+  const resp = makeGraphQLResponse([tr]);
+  const { records } = parseBookmarksResponse(resp, NOW);
+  assert.equal(records.length, 1);
+  assert.equal(records[0].bookmarkedAt, null); // no sortIndex = stays null
+});
+
 test('parseBookmarksResponse: parses entries and cursor', () => {
   const tr1 = makeTweetResult();
   const tr2 = makeTweetResult({ legacy: { id_str: '2222222', full_text: 'Second tweet' } });
