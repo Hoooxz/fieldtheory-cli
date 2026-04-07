@@ -10,7 +10,7 @@ export function dataDir(): string {
 
 function ensureDirSync(dir: string): void {
   if (!fs.existsSync(dir)) {
-    fs.mkdirSync(dir, { recursive: true });
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
   }
 }
 
@@ -46,6 +46,10 @@ export function bookmarkMediaManifestPath(): string {
 
 export function twitterBookmarksIndexPath(): string {
   return path.join(dataDir(), 'bookmarks.db');
+}
+
+export function preferencesPath(): string {
+  return path.join(dataDir(), '.preferences');
 }
 
 export function isFirstRun(): boolean {

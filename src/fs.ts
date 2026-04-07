@@ -1,4 +1,4 @@
-import { access, mkdir, readFile, readdir, writeFile } from 'node:fs/promises';
+import { access, mkdir, readFile, readdir, writeFile, rename } from 'node:fs/promises';
 
 export async function ensureDir(dirPath: string): Promise<void> {
   await mkdir(dirPath, { recursive: true });
@@ -22,7 +22,9 @@ export async function listFiles(dirPath: string): Promise<string[]> {
 }
 
 export async function writeJson(filePath: string, value: unknown): Promise<void> {
-  await writeFile(filePath, JSON.stringify(value, null, 2), 'utf8');
+  const tmp = filePath + '.tmp';
+  await writeFile(tmp, JSON.stringify(value, null, 2), 'utf8');
+  await rename(tmp, filePath);
 }
 
 export async function readJson<T>(filePath: string): Promise<T> {
@@ -31,8 +33,10 @@ export async function readJson<T>(filePath: string): Promise<T> {
 }
 
 export async function writeJsonLines(filePath: string, rows: unknown[]): Promise<void> {
+  const tmp = filePath + '.tmp';
   const content = rows.map((row) => JSON.stringify(row)).join('\n') + (rows.length ? '\n' : '');
-  await writeFile(filePath, content, 'utf8');
+  await writeFile(tmp, content, 'utf8');
+  await rename(tmp, filePath);
 }
 
 export async function readJsonLines<T>(filePath: string): Promise<T[]> {

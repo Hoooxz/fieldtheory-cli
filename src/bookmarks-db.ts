@@ -315,10 +315,15 @@ export async function buildIndex(options?: { force?: boolean }): Promise<{ dbPat
 
     if (newRecords.length > 0) {
       db.run('BEGIN TRANSACTION');
-      for (const record of newRecords) {
-        insertRecord(db, record);
+      try {
+        for (const record of newRecords) {
+          insertRecord(db, record);
+        }
+        db.run('COMMIT');
+      } catch (err) {
+        db.run('ROLLBACK');
+        throw err;
       }
-      db.run('COMMIT');
     }
 
     // Rebuild FTS index from content table
@@ -390,7 +395,16 @@ export async function searchBookmarks(options: SearchOptions): Promise<SearchRes
     }
     params.push(limit);
 
-    const rows = db.exec(sql, params);
+    let rows;
+    try {
+      rows = db.exec(sql, params);
+    } catch (err) {
+      const msg = (err as Error).message ?? '';
+      if (msg.includes('fts5') || msg.includes('MATCH') || msg.includes('syntax')) {
+        throw new Error(`Invalid search query: "${options.query}". Try simpler terms or wrap phrases in double quotes.`);
+      }
+      throw err;
+    }
     if (!rows.length) return [];
 
     return rows[0].values.map((row) => ({
