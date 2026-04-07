@@ -217,6 +217,30 @@ test('convertTweetToRecord: handles tweet with no user results', () => {
   assert.equal(result.url, 'https://x.com/_/status/999');
 });
 
+test('convertTweetToRecord: prefers note tweet text for articles/long-form', () => {
+  const tr = makeTweetResult({
+    legacy: { full_text: 'Truncated text...' },
+    tweet: {
+      note_tweet: {
+        note_tweet_results: {
+          result: {
+            text: 'This is the full article text that would normally be truncated in legacy.full_text',
+          },
+        },
+      },
+    },
+  });
+  const result = convertTweetToRecord(tr, NOW);
+  assert.ok(result);
+  assert.equal(result.text, 'This is the full article text that would normally be truncated in legacy.full_text');
+});
+
+test('convertTweetToRecord: falls back to legacy text when no note tweet', () => {
+  const result = convertTweetToRecord(makeTweetResult(), NOW);
+  assert.ok(result);
+  assert.equal(result.text, 'Hello world, this is a test tweet!');
+});
+
 test('convertTweetToRecord: extracts quoted tweet snapshot', () => {
   const tr = makeTweetResult({
     legacy: { quoted_status_id_str: '5555555' },

@@ -247,11 +247,15 @@ export function convertTweetToRecord(tweetResult: any, now: string): BookmarkRec
     }
   }
 
+  // X Articles / long-form note tweets store full text separately
+  const noteTweetText = tweet?.note_tweet?.note_tweet_results?.result?.text;
+  const text = noteTweetText ?? legacy.full_text ?? legacy.text ?? '';
+
   return {
     id: tweetId,
     tweetId,
     url: `https://x.com/${authorHandle ?? '_'}/status/${tweetId}`,
-    text: legacy.full_text ?? legacy.text ?? '',
+    text,
     authorHandle,
     authorName,
     authorProfileImageUrl,
