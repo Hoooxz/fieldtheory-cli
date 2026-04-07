@@ -33,6 +33,20 @@ import { createRequire } from 'node:module';
 const SPINNER = ['\u280b', '\u2819', '\u2839', '\u2838', '\u283c', '\u2834', '\u2826', '\u2827', '\u2807', '\u280f'];
 let spinnerIdx = 0;
 
+/** Creates a spinner that animates independently of data callbacks. */
+function createSpinner(renderLine: () => string): { update: () => void; stop: () => void } {
+  let line = '';
+  const tick = () => {
+    const spin = SPINNER[spinnerIdx++ % SPINNER.length];
+    process.stderr.write(`\r\x1b[K  ${spin} ${line}`);
+  };
+  const interval = setInterval(tick, 80);
+  return {
+    update: () => { line = renderLine(); },
+    stop: () => { clearInterval(interval); process.stderr.write('\n'); },
+  };
+}
+
 function renderProgress(status: SyncProgress, startTime: number): void {
   const elapsed = Math.round((Date.now() - startTime) / 1000);
   const spin = SPINNER[spinnerIdx++ % SPINNER.length];
@@ -375,16 +389,21 @@ export function buildCli() {
         if (options.gaps) {
           const startTime = Date.now();
           process.stderr.write('  Filling gaps (quoted tweets, truncated text)...\n');
+          let lastProgress: GapFillProgress = { done: 0, total: 0, quotedFetched: 0, textExpanded: 0, failed: 0 };
+          const spinner = createSpinner(() => {
+            const p = lastProgress;
+            const pct = p.total > 0 ? Math.round((p.done / p.total) * 100) : 0;
+            const elapsed = Math.round((Date.now() - startTime) / 1000);
+            return `${p.done}/${p.total} (${pct}%) \u2502 ${p.quotedFetched} quoted \u2502 ${p.textExpanded} expanded \u2502 ${p.failed} failed \u2502 ${elapsed}s`;
+          });
           const result = await syncGaps({
             delayMs: Number(options.delayMs) || 300,
             onProgress: (progress: GapFillProgress) => {
-              const pct = progress.total > 0 ? Math.round((progress.done / progress.total) * 100) : 0;
-              const elapsed = Math.round((Date.now() - startTime) / 1000);
-              const spin = SPINNER[spinnerIdx++ % SPINNER.length];
-              process.stderr.write(`\r\x1b[K  ${spin} ${progress.done}/${progress.total} (${pct}%) \u2502 ${progress.quotedFetched} quoted \u2502 ${progress.textExpanded} expanded \u2502 ${progress.failed} failed \u2502 ${elapsed}s`);
+              lastProgress = progress;
+              spinner.update();
             },
           });
-          process.stderr.write('\n');
+          spinner.stop();
           if (result.total === 0) {
             console.log('  No gaps found \u2014 all bookmarks are fully enriched.');
           } else {
@@ -441,6 +460,11 @@ export function buildCli() {
           }
         } else {
           const startTime = Date.now();
+          let lastSync: SyncProgress = { page: 0, totalFetched: 0, newAdded: 0, running: true, done: false };
+          const spinner = createSpinner(() => {
+            const elapsed = Math.round((Date.now() - startTime) / 1000);
+            return `Syncing bookmarks...  ${lastSync.newAdded} new  \u2502  page ${lastSync.page}  \u2502  ${elapsed}s`;
+          });
           const result = await syncBookmarksGraphQL({
             incremental: !Boolean(options.rebuild),
             maxPages: Number(options.maxPages) || 500,
@@ -450,8 +474,9 @@ export function buildCli() {
             chromeUserDataDir: options.chromeUserDataDir ? String(options.chromeUserDataDir) : undefined,
             chromeProfileDirectory: options.chromeProfileDirectory ? String(options.chromeProfileDirectory) : undefined,
             onProgress: (status: SyncProgress) => {
-              renderProgress(status, startTime);
-              if (status.done) process.stderr.write('\n');
+              lastSync = status;
+              spinner.update();
+              if (status.done) spinner.stop();
             },
           });
 
