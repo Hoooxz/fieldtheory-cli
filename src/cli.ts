@@ -3,8 +3,8 @@ import { Command } from 'commander';
 import { syncTwitterBookmarks } from './bookmarks.js';
 import { getBookmarkStatusView, formatBookmarkStatus } from './bookmarks-service.js';
 import { runTwitterOAuthFlow } from './xauth.js';
-import { syncBookmarksGraphQL } from './graphql-bookmarks.js';
-import type { SyncProgress } from './graphql-bookmarks.js';
+import { syncBookmarksGraphQL, syncGaps } from './graphql-bookmarks.js';
+import type { SyncProgress, GapFillProgress } from './graphql-bookmarks.js';
 import { fetchBookmarkMediaBatch } from './bookmark-media.js';
 import {
   buildIndex,
@@ -20,14 +20,50 @@ import {
 } from './bookmarks-db.js';
 import { formatClassificationSummary } from './bookmark-classify.js';
 import { classifyWithLlm, classifyDomainsWithLlm } from './bookmark-classify-llm.js';
+import { resolveEngine, detectAvailableEngines } from './engine.js';
+import { loadPreferences, savePreferences } from './preferences.js';
 import { renderViz } from './bookmarks-viz.js';
 import { dataDir, ensureDataDir, isFirstRun, twitterBookmarksIndexPath } from './paths.js';
 import fs from 'node:fs';
+import path from 'node:path';
+import { createRequire } from 'node:module';
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
 const SPINNER = ['\u280b', '\u2819', '\u2839', '\u2838', '\u283c', '\u2834', '\u2826', '\u2827', '\u2807', '\u280f'];
 let spinnerIdx = 0;
+
+/** Creates a spinner that animates independently of data callbacks. */
+function createSpinner(renderLine: () => string): { update: () => void; stop: () => void } {
+  let line = '';
+  let stopped = false;
+  const tick = () => {
+    if (stopped) return;
+    const spin = SPINNER[spinnerIdx++ % SPINNER.length];
+    process.stderr.write(`\r\x1b[K  ${spin} ${line}`);
+  };
+  const interval = setInterval(tick, 80);
+  const stop = () => {
+    if (stopped) return;
+    stopped = true;
+    clearInterval(interval);
+    process.stderr.write('\n');
+  };
+
+  // Graceful interrupt — stop spinner, show friendly message
+  const onSigint = () => {
+    stop();
+    console.log('\n  Interrupted. Your data is safe \u2014 progress has been saved.');
+    console.log('  Run the same command again to pick up where you left off.\n');
+    process.exit(0);
+  };
+  process.once('SIGINT', onSigint);
+
+  return {
+    update: () => { line = renderLine(); },
+    stop: () => { process.removeListener('SIGINT', onSigint); stop(); },
+  };
+}
 
 function renderProgress(status: SyncProgress, startTime: number): void {
   const elapsed = Math.round((Date.now() - startTime) / 1000);
@@ -58,14 +94,119 @@ function warnIfEmpty(totalBookmarks: number): void {
   console.log(`    \u2022 You may be logged into a different Chrome profile than the one with X/Twitter\n`);
 }
 
-const LOGO = `
-   \x1b[2m\u250c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2510\x1b[0m
-   \x1b[2m\u2502\x1b[0m  \x1b[1mF i e l d   T h e o r y\x1b[0m    \x1b[2m\u2502\x1b[0m
-   \x1b[2m\u2502\x1b[0m  \x1b[2mfieldtheory.dev/cli\x1b[0m        \x1b[2m\u2502\x1b[0m
-   \x1b[2m\u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2518\x1b[0m`;
+// ── Update checker ────────────────────────────────────────────────────────
+
+const UPDATE_CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000; // 1 day
+
+function getLocalVersion(): string {
+  try {
+    const require = createRequire(import.meta.url);
+    const pkg = require('../package.json');
+    return pkg.version;
+  } catch {
+    return '0.0.0';
+  }
+}
+
+export function compareVersions(a: string, b: string): number {
+  const pa = a.split('.').map(Number);
+  const pb = b.split('.').map(Number);
+  for (let i = 0; i < 3; i++) {
+    if ((pa[i] ?? 0) !== (pb[i] ?? 0)) return (pa[i] ?? 0) - (pb[i] ?? 0);
+  }
+  return 0;
+}
+
+async function checkForUpdate(): Promise<void> {
+  try {
+    const cacheFile = path.join(dataDir(), '.update-check');
+    // Skip if checked recently
+    try {
+      const stat = fs.statSync(cacheFile);
+      if (Date.now() - stat.mtimeMs < UPDATE_CHECK_INTERVAL_MS) return;
+    } catch { /* file doesn't exist, proceed */ }
+
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 5000);
+    const res = await fetch('https://registry.npmjs.org/fieldtheory/latest', {
+      signal: controller.signal,
+      headers: { accept: 'application/json' },
+    });
+    clearTimeout(timeout);
+
+    if (!res.ok) return;
+    const data = await res.json() as any;
+    const latest = data?.version;
+    if (!latest) return;
+
+    // Touch the cache file regardless of result
+    fs.writeFileSync(cacheFile, latest);
+
+    const local = getLocalVersion();
+    if (compareVersions(latest, local) > 0) {
+      console.log(`\n  \u2728 Update available: ${local} \u2192 ${latest}  \u2014  npm update -g fieldtheory`);
+    }
+  } catch { /* network error, offline, etc — silently skip */ }
+}
+
+// ── What's new ────────────────────────────────────────────────────────────
+
+const WHATS_NEW: Record<string, string[]> = {
+  '1.2.2': [
+    'ft sync --gaps \u2014 backfill missing quoted tweets and expand truncated articles',
+    'Quoted tweet content and full article text now captured automatically during sync',
+    'Bookmark date (when you bookmarked, not just when it was posted) now tracked',
+    'ft sync --rebuild replaces --full',
+    'Update notifications when a new version is available',
+  ],
+};
+
+function showWhatsNew(): void {
+  const version = getLocalVersion();
+  const versionFile = path.join(dataDir(), '.last-version');
+
+  let lastSeen: string | undefined;
+  try { lastSeen = fs.readFileSync(versionFile, 'utf-8').trim(); } catch { /* first run */ }
+
+  // Update the stored version
+  try { fs.writeFileSync(versionFile, version); } catch { /* read-only, etc */ }
+
+  if (!lastSeen || lastSeen === version) return;
+
+  // Collect features from all versions newer than lastSeen
+  const newFeatures: string[] = [];
+  for (const [v, features] of Object.entries(WHATS_NEW)) {
+    if (compareVersions(v, lastSeen) > 0 && compareVersions(v, version) <= 0) {
+      newFeatures.push(...features);
+    }
+  }
+
+  if (newFeatures.length === 0) return;
+
+  console.log(`\n  \x1b[1mWhat's new in v${version}:\x1b[0m`);
+  for (const feature of newFeatures) {
+    console.log(`    \u2022 ${feature}`);
+  }
+  console.log();
+}
+
+function logo(): string {
+  const v = getLocalVersion();
+  const vLabel = `v${v}`;
+  const innerW = 33;
+  const line1 = 'F i e l d   T h e o r y';
+  const line2 = 'fieldtheory.dev/cli';
+  const pad1 = innerW - line1.length - 3;
+  const pad2 = innerW - line2.length - vLabel.length - 4;
+  return `
+     \x1b[2m\u250c${'\u2500'.repeat(innerW)}\u2510\x1b[0m
+     \x1b[2m\u2502\x1b[0m  \x1b[1m${line1}\x1b[0m${' '.repeat(pad1)} \x1b[2m\u2502\x1b[0m
+     \x1b[2m\u2502\x1b[0m  \x1b[2m${line2}\x1b[0m${' '.repeat(Math.max(pad2, 1))}\x1b[2m${vLabel}\x1b[0m  \x1b[2m\u2502\x1b[0m
+     \x1b[2m\u2514${'\u2500'.repeat(innerW)}\u2518\x1b[0m`;
+}
 
 export function showWelcome(): void {
-  console.log(LOGO);
+  console.log(logo());
   console.log(`
   Save a local copy of your X/Twitter bookmarks. Search them,
   classify them, and make them available to any AI agent.
@@ -81,7 +222,7 @@ export function showWelcome(): void {
 }
 
 export async function showDashboard(): Promise<void> {
-  console.log(LOGO);
+  console.log(logo());
   try {
     const view = await getBookmarkStatusView();
     const ago = view.lastUpdated ? timeAgo(view.lastUpdated) : 'never';
@@ -192,9 +333,12 @@ export function buildCli() {
   }
 
   async function classifyNew(): Promise<void> {
+    const engine = await resolveEngine();
+
     const start = Date.now();
     process.stderr.write('  Classifying new bookmarks (categories)...\n');
     const catResult = await classifyWithLlm({
+      engine,
       onBatch: (done: number, total: number) => {
         const pct = total > 0 ? Math.round((done / total) * 100) : 0;
         const elapsed = Math.round((Date.now() - start) / 1000);
@@ -208,6 +352,7 @@ export function buildCli() {
     const domStart = Date.now();
     process.stderr.write('  Classifying new bookmarks (domains)...\n');
     const domResult = await classifyDomainsWithLlm({
+      engine,
       all: false,
       onBatch: (done: number, total: number) => {
         const pct = total > 0 ? Math.round((done / total) * 100) : 0;
@@ -223,10 +368,11 @@ export function buildCli() {
   program
     .name('ft')
     .description('Self-custody for your X/Twitter bookmarks. Sync, search, classify, and explore locally.')
-    .version('1.2.1')
+    .version('1.2.2')
     .showHelpAfterError()
     .hook('preAction', () => {
-      console.log(LOGO);
+      console.log(logo());
+      showWhatsNew();
     });
 
   // ── sync ────────────────────────────────────────────────────────────────
@@ -235,7 +381,9 @@ export function buildCli() {
     .command('sync')
     .description('Sync bookmarks from X into your local database')
     .option('--api', 'Use OAuth v2 API instead of Chrome session', false)
-    .option('--full', 'Full crawl instead of incremental sync', false)
+    .option('--rebuild', 'Full re-crawl of all bookmarks', false)
+    .option('--gaps', 'Backfill missing data (quoted tweets, truncated articles)', false)
+    .option('--yes', 'Skip confirmation prompts', false)
     .option('--classify', 'Classify new bookmarks with LLM after syncing', false)
     .option('--max-pages <n>', 'Max pages to fetch', (v: string) => Number(v), 500)
     .option('--target-adds <n>', 'Stop after N new bookmarks', (v: string) => Number(v))
@@ -249,8 +397,87 @@ export function buildCli() {
       ensureDataDir();
 
       try {
+        if (options.rebuild && options.gaps) {
+          console.error('  Error: --rebuild and --gaps cannot be used together.');
+          process.exitCode = 1;
+          return;
+        }
+
+        // ── gaps mode: backfill missing data for existing bookmarks ──
+        if (options.gaps) {
+          const startTime = Date.now();
+          process.stderr.write('  Filling gaps (quoted tweets, truncated text)...\n');
+          let lastProgress: GapFillProgress = { done: 0, total: 0, quotedFetched: 0, textExpanded: 0, failed: 0 };
+          const spinner = createSpinner(() => {
+            const p = lastProgress;
+            const pct = p.total > 0 ? Math.round((p.done / p.total) * 100) : 0;
+            const elapsed = Math.round((Date.now() - startTime) / 1000);
+            return `${p.done}/${p.total} (${pct}%) \u2502 ${p.quotedFetched} quoted \u2502 ${p.textExpanded} expanded \u2502 ${p.failed} failed \u2502 ${elapsed}s`;
+          });
+          const result = await syncGaps({
+            delayMs: Number(options.delayMs) || 300,
+            onProgress: (progress: GapFillProgress) => {
+              lastProgress = progress;
+              spinner.update();
+            },
+          });
+          spinner.stop();
+          if (result.total === 0) {
+            console.log('  No gaps found \u2014 all bookmarks are fully enriched.');
+          } else {
+            if (result.quotedTweetsFilled > 0) console.log(`  \u2713 ${result.quotedTweetsFilled} quoted tweets filled`);
+            if (result.textExpanded > 0) console.log(`  \u2713 ${result.textExpanded} truncated texts expanded`);
+            if (result.failed > 0) {
+              // Write failure log
+              const logPath = path.join(dataDir(), 'gaps-failures.json');
+              const byReason: Record<string, number> = {};
+              for (const f of result.failures) {
+                byReason[f.reason] = (byReason[f.reason] ?? 0) + 1;
+              }
+              fs.writeFileSync(logPath, JSON.stringify({ failures: result.failures, summary: byReason }, null, 2));
+
+              console.log(`  ${result.failed} unavailable:`);
+              for (const [reason, count] of Object.entries(byReason)) {
+                console.log(`    \u2022 ${count} ${reason}`);
+              }
+              console.log(`  Details: ${logPath}`);
+            }
+            if (result.bookmarkedAtMissing > 0) {
+              console.log(`  ${result.bookmarkedAtMissing} bookmarks missing bookmark date \u2014 run ft sync to fill`);
+            }
+          }
+          return;
+        }
+
+        // ── rebuild confirmation ──
+        if (options.rebuild) {
+          const dir = dataDir();
+          const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+          const backupDir = `${dir}-backup-${timestamp}`;
+
+          console.log(`  \u26a0 Rebuild will re-crawl all bookmarks from X.`);
+          console.log(`  Your existing data will be merged (not deleted), but`);
+          console.log(`  this is a full re-sync and may take a while.\n`);
+          console.log(`  To back up first, run:`);
+          console.log(`    cp -r ${dir} ${backupDir}\n`);
+
+          // Allow --yes to skip confirmation
+          if (!options.yes) {
+            const rl = await import('node:readline');
+            const prompt = rl.createInterface({ input: process.stdin, output: process.stdout });
+            const answer = await new Promise<string>((resolve) => {
+              prompt.question('  Continue? (y/N) ', resolve);
+            });
+            prompt.close();
+            if (answer.trim().toLowerCase() !== 'y') {
+              console.log('  Aborted.');
+              return;
+            }
+          }
+        }
+
         const useApi = Boolean(options.api);
-        const mode = Boolean(options.full) ? 'full' : 'incremental';
+        const mode = Boolean(options.rebuild) ? 'full' : 'incremental';
 
         if (useApi) {
           const result = await syncTwitterBookmarks(mode, {
@@ -265,8 +492,13 @@ export function buildCli() {
           }
         } else {
           const startTime = Date.now();
+          let lastSync: SyncProgress = { page: 0, totalFetched: 0, newAdded: 0, running: true, done: false };
+          const spinner = createSpinner(() => {
+            const elapsed = Math.round((Date.now() - startTime) / 1000);
+            return `Syncing bookmarks...  ${lastSync.newAdded} new  \u2502  page ${lastSync.page}  \u2502  ${elapsed}s`;
+          });
           const result = await syncBookmarksGraphQL({
-            incremental: !Boolean(options.full),
+            incremental: !Boolean(options.rebuild),
             maxPages: Number(options.maxPages) || 500,
             targetAdds: typeof options.targetAdds === 'number' && !Number.isNaN(options.targetAdds) ? options.targetAdds : undefined,
             delayMs: Number(options.delayMs) || 600,
@@ -274,8 +506,9 @@ export function buildCli() {
             chromeUserDataDir: options.chromeUserDataDir ? String(options.chromeUserDataDir) : undefined,
             chromeProfileDirectory: options.chromeProfileDirectory ? String(options.chromeProfileDirectory) : undefined,
             onProgress: (status: SyncProgress) => {
-              renderProgress(status, startTime);
-              if (status.done) process.stderr.write('\n');
+              lastSync = status;
+              spinner.update();
+              if (status.done) spinner.stop();
             },
           });
 
@@ -302,6 +535,8 @@ export function buildCli() {
           console.log(`\n  You can also just tell Claude to use the ft CLI to search and`);
           console.log(`  explore your bookmarks. It already knows how.\n`);
         }
+
+        await checkForUpdate();
       } catch (err) {
         const msg = (err as Error).message;
         if (firstRun && (msg.includes('cookie') || msg.includes('Cookie') || msg.includes('Keychain'))) {
@@ -454,9 +689,12 @@ export function buildCli() {
         console.log(`Indexed ${result.recordCount} bookmarks \u2192 ${result.dbPath}`);
         console.log(formatClassificationSummary(result.summary));
       } else {
+        const engine = await resolveEngine();
+
         let catStart = Date.now();
         process.stderr.write('Classifying categories with LLM (batches of 50, ~2 min per batch)...\n');
         const catResult = await classifyWithLlm({
+          engine,
           onBatch: (done: number, total: number) => {
             const pct = total > 0 ? Math.round((done / total) * 100) : 0;
             const elapsed = Math.round((Date.now() - catStart) / 1000);
@@ -469,6 +707,7 @@ export function buildCli() {
         let domStart = Date.now();
         process.stderr.write('\nClassifying domains with LLM (batches of 50, ~2 min per batch)...\n');
         const domResult = await classifyDomainsWithLlm({
+          engine,
           all: false,
           onBatch: (done: number, total: number) => {
             const pct = total > 0 ? Math.round((done / total) * 100) : 0;
@@ -488,9 +727,11 @@ export function buildCli() {
     .option('--all', 'Re-classify all bookmarks, not just missing')
     .action(safe(async (options) => {
       if (!requireData()) return;
+      const engine = await resolveEngine();
       const start = Date.now();
       process.stderr.write('Classifying bookmark domains with LLM (batches of 50, ~2 min per batch)...\n');
       const result = await classifyDomainsWithLlm({
+        engine,
         all: options.all ?? false,
         onBatch: (done: number, total: number) => {
           const pct = total > 0 ? Math.round((done / total) * 100) : 0;
@@ -499,6 +740,65 @@ export function buildCli() {
         },
       });
       console.log(`\nDomains: ${result.classified}/${result.totalUnclassified} classified`);
+    }));
+
+  // ── model ───────────────────────────────────────────────────────────────
+
+  program
+    .command('model')
+    .description('View or change the default LLM engine for classification')
+    .argument('[engine]', 'Set default engine directly (e.g. claude, codex)')
+    .action(safe(async (engineArg?: string) => {
+      const available = detectAvailableEngines();
+      const prefs = loadPreferences();
+
+      if (available.length === 0) {
+        console.log('  No LLM engines found on PATH.');
+        console.log('  Install one of:');
+        console.log('    - Claude Code: https://docs.anthropic.com/en/docs/claude-code');
+        console.log('    - Codex CLI:   https://github.com/openai/codex');
+        return;
+      }
+
+      // Direct set: ft model claude
+      if (engineArg) {
+        if (!available.includes(engineArg)) {
+          console.log(`  "${engineArg}" is not available. Found: ${available.join(', ')}`);
+          process.exitCode = 1;
+          return;
+        }
+        savePreferences({ ...prefs, defaultEngine: engineArg });
+        console.log(`  \u2713 Default model set to ${engineArg}`);
+        return;
+      }
+
+      // Interactive picker
+      console.log('  Available engines:\n');
+      for (const name of available) {
+        const marker = name === prefs.defaultEngine ? ' (default)' : '';
+        console.log(`    ${name}${marker}`);
+      }
+      console.log();
+
+      if (!process.stdin.isTTY) {
+        if (prefs.defaultEngine) console.log(`  Current default: ${prefs.defaultEngine}`);
+        console.log('  Set with: ft model <engine>');
+        return;
+      }
+
+      const readline = await import('node:readline');
+      const rl = readline.createInterface({ input: process.stdin, output: process.stderr });
+      const answer = await new Promise<string>((resolve) => {
+        rl.question('  Select default: ', (a) => { rl.close(); resolve(a.trim().toLowerCase()); });
+      });
+
+      if (available.includes(answer)) {
+        savePreferences({ ...prefs, defaultEngine: answer });
+        console.log(`  \u2713 Default model set to ${answer}`);
+      } else if (answer) {
+        console.log(`  "${answer}" is not available. Found: ${available.join(', ')}`);
+        process.exitCode = 1;
+      }
     }));
 
   // ── categories ──────────────────────────────────────────────────────────
@@ -624,7 +924,7 @@ export function buildCli() {
 
   const bookmarksAlias = program.command('bookmarks').description('(alias) Bookmark commands').helpOption(false);
   for (const cmd of ['sync', 'search', 'list', 'show', 'stats', 'viz', 'classify', 'classify-domains',
-    'categories', 'domains', 'index', 'auth', 'status', 'path', 'sample', 'fetch-media']) {
+    'categories', 'domains', 'model', 'index', 'auth', 'status', 'path', 'sample', 'fetch-media']) {
     bookmarksAlias.command(cmd).description(`Alias for: ft ${cmd}`).allowUnknownOption(true)
       .action(async () => {
         const args = ['node', 'ft', cmd, ...process.argv.slice(4)];

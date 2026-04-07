@@ -2,8 +2,10 @@ import { ensureDir, readJsonLines, writeJsonLines, readJson, writeJson, pathExis
 import { ensureDataDir, twitterBookmarksCachePath, twitterBookmarksMetaPath, twitterBackfillStatePath } from './paths.js';
 import { loadChromeSessionConfig } from './config.js';
 import { extractChromeXCookies } from './chrome-cookies.js';
-import type { BookmarkBackfillState, BookmarkCacheMeta, BookmarkRecord } from './types.js';
-import { exportBookmarksForSyncSeed } from './bookmarks-db.js';
+import type { BookmarkBackfillState, BookmarkCacheMeta, BookmarkRecord, QuotedTweetSnapshot } from './types.js';
+import { exportBookmarksForSyncSeed, updateQuotedTweets, updateBookmarkText } from './bookmarks-db.js';
+
+const CHROME_UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36';
 
 const X_PUBLIC_BEARER =
   'AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA';
@@ -146,7 +148,7 @@ function buildHeaders(csrfToken: string, cookieHeader?: string): Record<string, 
     'x-twitter-auth-type': 'OAuth2Session',
     'x-twitter-active-user': 'yes',
     'content-type': 'application/json',
-    'user-agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36',
+    'user-agent': CHROME_UA,
     cookie: cookieHeader ?? `ct0=${csrfToken}`,
   };
 }
@@ -213,11 +215,47 @@ export function convertTweetToRecord(tweetResult: any, now: string): BookmarkRec
     .map((u: any) => u.expanded_url)
     .filter((u: string | undefined) => u && !u.includes('t.co'));
 
+  // Extract quoted tweet if present
+  const quotedResult = tweet?.quoted_status_result?.result;
+  let quotedTweet: BookmarkRecord['quotedTweet'] | undefined;
+  if (quotedResult) {
+    const qtTweet = quotedResult.tweet ?? quotedResult;
+    const qtLegacy = qtTweet?.legacy;
+    if (qtLegacy) {
+      const qtId = qtLegacy.id_str ?? qtTweet?.rest_id;
+      const qtUser = qtTweet?.core?.user_results?.result;
+      const qtHandle = qtUser?.core?.screen_name ?? qtUser?.legacy?.screen_name;
+      const qtMediaEntities = qtLegacy?.extended_entities?.media ?? qtLegacy?.entities?.media ?? [];
+      quotedTweet = {
+        id: qtId,
+        text: qtLegacy.full_text ?? qtLegacy.text ?? '',
+        authorHandle: qtHandle,
+        authorName: qtUser?.core?.name ?? qtUser?.legacy?.name,
+        authorProfileImageUrl:
+          qtUser?.avatar?.image_url ?? qtUser?.legacy?.profile_image_url_https,
+        postedAt: qtLegacy.created_at ?? null,
+        media: qtMediaEntities.map((m: any) => m.media_url_https ?? m.media_url).filter(Boolean),
+        mediaObjects: qtMediaEntities.map((m: any) => ({
+          type: m.type,
+          url: m.media_url_https ?? m.media_url,
+          expandedUrl: m.expanded_url,
+          width: m.original_info?.width,
+          height: m.original_info?.height,
+        })),
+        url: `https://x.com/${qtHandle ?? '_'}/status/${qtId}`,
+      };
+    }
+  }
+
+  // X Articles / long-form note tweets store full text separately
+  const noteTweetText = tweet?.note_tweet?.note_tweet_results?.result?.text;
+  const text = noteTweetText ?? legacy.full_text ?? legacy.text ?? '';
+
   return {
     id: tweetId,
     tweetId,
     url: `https://x.com/${authorHandle ?? '_'}/status/${tweetId}`,
-    text: legacy.full_text ?? legacy.text ?? '',
+    text,
     authorHandle,
     authorName,
     authorProfileImageUrl,
@@ -229,6 +267,7 @@ export function convertTweetToRecord(tweetResult: any, now: string): BookmarkRec
     inReplyToStatusId: legacy.in_reply_to_status_id_str,
     inReplyToUserId: legacy.in_reply_to_user_id_str,
     quotedStatusId: legacy.quoted_status_id_str,
+    quotedTweet,
     language: legacy.lang,
     sourceApp: legacy.source,
     possiblySensitive: legacy.possibly_sensitive,
@@ -246,6 +285,19 @@ export function convertTweetToRecord(tweetResult: any, now: string): BookmarkRec
     tags: [],
     ingestedVia: 'graphql',
   };
+}
+
+const TWITTER_SNOWFLAKE_EPOCH = 1288834974657n;
+
+function snowflakeToIso(snowflake: string): string | null {
+  try {
+    const id = BigInt(snowflake);
+    const ms = Number(id >> 22n) + Number(TWITTER_SNOWFLAKE_EPOCH);
+    const date = new Date(ms);
+    return Number.isFinite(date.getTime()) ? date.toISOString() : null;
+  } catch {
+    return null;
+  }
 }
 
 export function parseBookmarksResponse(json: any, now?: string): PageResult {
@@ -271,7 +323,13 @@ export function parseBookmarksResponse(json: any, now?: string): PageResult {
     if (!tweetResult) continue;
 
     const record = convertTweetToRecord(tweetResult, ts);
-    if (record) records.push(record);
+    if (record) {
+      // Extract bookmarkedAt from the entry's sortIndex (snowflake timestamp)
+      if (entry.sortIndex) {
+        record.bookmarkedAt = snowflakeToIso(entry.sortIndex) ?? record.bookmarkedAt;
+      }
+      records.push(record);
+    }
   }
 
   return { records, nextCursor };
@@ -457,11 +515,11 @@ export async function syncBookmarksGraphQL(
       stopReason = 'target additions reached';
       break;
     }
-    if (incremental && reachedLatestStored) {
+    if (reachedLatestStored) {
       stopReason = 'caught up to newest stored bookmark';
       break;
     }
-    if (incremental && stalePages >= stalePageLimit) {
+    if (stalePages >= stalePageLimit) {
       stopReason = 'no new bookmarks (stale)';
       break;
     }
@@ -504,4 +562,210 @@ export async function syncBookmarksGraphQL(
   });
 
   return { added: totalAdded, totalBookmarks: existing.length, pages: page, stopReason, cachePath, statePath };
+}
+
+// ── Gap-fill: backfill missing data for existing bookmarks ────────────
+
+const SYNDICATION_URL = 'https://cdn.syndication.twimg.com/tweet-result';
+
+interface SyndicationResult {
+  snapshot: QuotedTweetSnapshot | null;
+  status: 'ok' | 'empty' | 'not_found' | 'forbidden' | 'rate_limited' | 'server_error' | 'error';
+  httpStatus?: number;
+}
+
+async function fetchTweetViaSyndication(tweetId: string): Promise<SyndicationResult> {
+  for (let attempt = 0; attempt < 4; attempt++) {
+    const response = await fetch(`${SYNDICATION_URL}?id=${tweetId}&token=x`, {
+      headers: {
+        'user-agent': CHROME_UA,
+      },
+    });
+
+    if (response.ok) {
+      const data = await response.json() as any;
+      if (!data?.text) return { snapshot: null, status: 'empty' };
+      const handle = data.user?.screen_name;
+      const mediaEntities: any[] = data.mediaDetails ?? [];
+      return {
+        status: 'ok',
+        snapshot: {
+          id: String(data.id_str ?? tweetId),
+          text: data.text,
+          authorHandle: handle,
+          authorName: data.user?.name,
+          authorProfileImageUrl: data.user?.profile_image_url_https,
+          postedAt: data.created_at ?? null,
+          media: mediaEntities.map((m: any) => m.media_url_https ?? m.media_url).filter(Boolean),
+          mediaObjects: mediaEntities.map((m: any) => ({
+            type: m.type,
+            url: m.media_url_https ?? m.media_url,
+            width: m.original_info?.width,
+            height: m.original_info?.height,
+          })),
+          url: `https://x.com/${handle ?? '_'}/status/${data.id_str ?? tweetId}`,
+        },
+      };
+    }
+
+    if (response.status === 429) {
+      await new Promise((r) => setTimeout(r, Math.min(15 * Math.pow(2, attempt), 120) * 1000));
+      continue;
+    }
+    if (response.status >= 500) {
+      await new Promise((r) => setTimeout(r, 5000 * (attempt + 1)));
+      continue;
+    }
+    // 404/403 — tweet unavailable, don't retry
+    const status = response.status === 404 ? 'not_found' as const : 'forbidden' as const;
+    return { snapshot: null, status, httpStatus: response.status };
+  }
+  return { snapshot: null, status: 'rate_limited' };
+}
+
+// Text >= 275 chars may be truncated by Twitter's legacy.full_text limit
+const TRUNCATION_THRESHOLD = 275;
+
+export interface GapFillProgress {
+  done: number;
+  total: number;
+  quotedFetched: number;
+  textExpanded: number;
+  failed: number;
+}
+
+export interface GapFillFailure {
+  tweetId: string;
+  reason: string;
+  url: string;
+}
+
+export interface GapFillResult {
+  quotedTweetsFilled: number;
+  textExpanded: number;
+  bookmarkedAtMissing: number;
+  failed: number;
+  failures: GapFillFailure[];
+  total: number;
+}
+
+export async function syncGaps(options?: {
+  onProgress?: (progress: GapFillProgress) => void;
+  delayMs?: number;
+}): Promise<GapFillResult> {
+  const delayMs = options?.delayMs ?? 300;
+  const cachePath = twitterBookmarksCachePath();
+  const records = await readJsonLines<BookmarkRecord>(cachePath);
+
+  // Gap 1: missing quoted tweets
+  const needsQuotedTweet = records.filter((r) => r.quotedStatusId && !r.quotedTweet);
+  const quotedIds = new Set(needsQuotedTweet.map((r) => r.quotedStatusId!));
+
+  // Gap 2: potentially truncated text (articles/long notes cut off by legacy.full_text)
+  const maybeTruncated = records.filter((r) => (r.text?.length ?? 0) >= TRUNCATION_THRESHOLD);
+  const truncatedIds = new Set(maybeTruncated.map((r) => r.tweetId));
+
+  // Build lookup indexes for applying results
+  const recordsByQuotedId = new Map<string, BookmarkRecord[]>();
+  for (const r of needsQuotedTweet) {
+    const list = recordsByQuotedId.get(r.quotedStatusId!) ?? [];
+    list.push(r);
+    recordsByQuotedId.set(r.quotedStatusId!, list);
+  }
+  const recordsByTweetId = new Map<string, BookmarkRecord[]>();
+  for (const r of maybeTruncated) {
+    const list = recordsByTweetId.get(r.tweetId) ?? [];
+    list.push(r);
+    recordsByTweetId.set(r.tweetId, list);
+  }
+
+  // Combine all IDs to fetch — deduplicated
+  const allFetchIds = [...new Set([...quotedIds, ...truncatedIds])];
+  const total = allFetchIds.length;
+
+  let quotedFetched = 0;
+  let textExpanded = 0;
+  let failed = 0;
+  const failures: GapFillFailure[] = [];
+  const dbQuotedUpdates: Array<{ id: string; quotedTweet: QuotedTweetSnapshot }> = [];
+  const dbTextUpdates: Array<{ id: string; text: string }> = [];
+
+  // Fetch and apply incrementally
+  for (let i = 0; i < allFetchIds.length; i++) {
+    const tweetId = allFetchIds[i];
+    let snapshot: QuotedTweetSnapshot | null = null;
+    try {
+      const result = await fetchTweetViaSyndication(tweetId);
+      snapshot = result.snapshot;
+      if (!snapshot) {
+        failed++;
+        const reasons: Record<string, string> = {
+          empty: 'tweet exists but has no text content',
+          not_found: 'deleted or does not exist',
+          forbidden: 'private or suspended account',
+          rate_limited: 'rate limited after 4 retries',
+          server_error: 'X server error after 4 retries',
+        };
+        failures.push({
+          tweetId,
+          reason: reasons[result.status] ?? result.status,
+          url: `https://x.com/_/status/${tweetId}`,
+        });
+      }
+    } catch (err) {
+      failed++;
+      failures.push({
+        tweetId,
+        reason: (err as Error).message ?? 'unknown error',
+        url: `https://x.com/_/status/${tweetId}`,
+      });
+    }
+
+    // Apply immediately so progress is accurate
+    if (snapshot) {
+      // Quoted tweet gap
+      for (const record of recordsByQuotedId.get(tweetId) ?? []) {
+        if (!record.quotedTweet) {
+          record.quotedTweet = snapshot;
+          dbQuotedUpdates.push({ id: record.id, quotedTweet: snapshot });
+          quotedFetched++;
+        }
+      }
+      // Truncated text gap
+      for (const record of recordsByTweetId.get(tweetId) ?? []) {
+        if (snapshot.text.length > (record.text?.length ?? 0)) {
+          record.text = snapshot.text;
+          dbTextUpdates.push({ id: record.id, text: snapshot.text });
+          textExpanded++;
+        }
+      }
+    }
+
+    options?.onProgress?.({
+      done: i + 1,
+      total,
+      quotedFetched,
+      textExpanded,
+      failed,
+    });
+
+    // Checkpoint every 100 fetches
+    if ((i + 1) % 100 === 0) {
+      await writeJsonLines(cachePath, records);
+    }
+
+    if (i < allFetchIds.length - 1) {
+      await new Promise((r) => setTimeout(r, delayMs));
+    }
+  }
+
+  // Find bookmarks missing bookmarkedAt (filled on next sync, not via syndication)
+  const bookmarkedAtMissing = records.filter((r) => !r.bookmarkedAt).length;
+
+  // Final persist
+  await writeJsonLines(cachePath, records);
+  if (dbQuotedUpdates.length > 0) await updateQuotedTweets(dbQuotedUpdates);
+  if (dbTextUpdates.length > 0) await updateBookmarkText(dbTextUpdates);
+
+  return { quotedTweetsFilled: quotedFetched, textExpanded, bookmarkedAtMissing, failed, failures, total };
 }
