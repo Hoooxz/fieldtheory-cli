@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {
   convertTweetToRecord,
   parseBookmarksResponse,
+  sanitizeBookmarkedAt,
   scoreRecord,
   mergeBookmarkRecord,
   mergeRecords,
@@ -299,10 +300,10 @@ test('convertTweetToRecord: handles missing quoted tweet gracefully', () => {
 
 test('parseBookmarksResponse: extracts bookmarkedAt from sortIndex', () => {
   const tr = makeTweetResult();
-  // Snowflake for a known date: encode March 10 2026 00:00:00 UTC
-  // Twitter epoch: 1288834974657, target ms: 1773187200000
-  // offset = 1773187200000 - 1288834974657 = 484352225343
-  // snowflake = offset << 22 = 484352225343 * 4194304 = 2031116076166176768
+  // Snowflake for a known date: encode March 11 2026 00:00:00 UTC (after tweet created_at of March 10 12:00)
+  // Twitter epoch: 1288834974657, target ms: 1773273600000
+  // offset = 1773273600000 - 1288834974657 = 484438625343
+  // snowflake = offset << 22 = 2031520476165046272
   const resp = {
     data: {
       bookmark_timeline_v2: {
@@ -311,7 +312,7 @@ test('parseBookmarksResponse: extracts bookmarkedAt from sortIndex', () => {
             type: 'TimelineAddEntries',
             entries: [{
               entryId: 'tweet-0',
-              sortIndex: '2031116076166176768',
+              sortIndex: '2031520476165046272',
               content: {
                 itemContent: { tweet_results: { result: tr } },
               },
@@ -324,7 +325,7 @@ test('parseBookmarksResponse: extracts bookmarkedAt from sortIndex', () => {
   const { records } = parseBookmarksResponse(resp, NOW);
   assert.equal(records.length, 1);
   assert.ok(records[0].bookmarkedAt);
-  // Should decode to approximately March 10 2026
+  // Should decode to March 11 2026
   const parsed = new Date(records[0].bookmarkedAt!);
   assert.ok(parsed.getFullYear() === 2026);
   assert.ok(parsed.getMonth() === 2); // March = month 2
@@ -336,6 +337,37 @@ test('parseBookmarksResponse: handles missing sortIndex gracefully', () => {
   const { records } = parseBookmarksResponse(resp, NOW);
   assert.equal(records.length, 1);
   assert.equal(records[0].bookmarkedAt, null); // no sortIndex = stays null
+});
+
+test('parseBookmarksResponse: clears sortIndex timestamps earlier than tweet creation', () => {
+  const tr = makeTweetResult({
+    legacy: {
+      created_at: 'Fri Apr 03 12:00:00 +0000 2026',
+    },
+  });
+  const resp = {
+    data: {
+      bookmark_timeline_v2: {
+        timeline: {
+          instructions: [{
+            type: 'TimelineAddEntries',
+            entries: [{
+              entryId: 'tweet-0',
+              // Decodes to 2024-11-27T21:53:29.879Z, which is impossible for a 2026 tweet.
+              sortIndex: '1861891119789912064',
+              content: {
+                itemContent: { tweet_results: { result: tr } },
+              },
+            }],
+          }],
+        },
+      },
+    },
+  };
+
+  const { records } = parseBookmarksResponse(resp, NOW);
+  assert.equal(records.length, 1);
+  assert.equal(records[0].bookmarkedAt, null);
 });
 
 test('parseBookmarksResponse: parses entries and cursor', () => {
@@ -489,10 +521,31 @@ test('mergeRecords: handles empty inputs', () => {
   assert.equal(added, 0);
 });
 
+test('sanitizeBookmarkedAt: clears timestamps earlier than postedAt', () => {
+  const record = sanitizeBookmarkedAt(makeRecord({
+    postedAt: 'Fri Apr 03 12:00:00 +0000 2026',
+    bookmarkedAt: '2024-11-26T00:00:00.000Z',
+  }));
+
+  assert.equal(record.bookmarkedAt, null);
+});
+
+test('sanitizeBookmarkedAt: clears timestamps too far after syncedAt', () => {
+  const record = sanitizeBookmarkedAt(makeRecord({
+    postedAt: 'Tue Mar 10 12:00:00 +0000 2026',
+    syncedAt: '2026-03-28T00:00:00.000Z',
+    bookmarkedAt: '2026-03-29T00:00:00.000Z',
+  }));
+
+  assert.equal(record.bookmarkedAt, null);
+});
+
 test('formatSyncResult: formats all fields', () => {
   const result = formatSyncResult({
     added: 50,
+    bookmarkedAtRepaired: 7,
     totalBookmarks: 6000,
+    bookmarkedAtMissing: 12,
     pages: 300,
     stopReason: 'end of bookmarks',
     cachePath: '/tmp/cache.jsonl',
@@ -500,7 +553,9 @@ test('formatSyncResult: formats all fields', () => {
   });
 
   assert.ok(result.includes('50'));
+  assert.ok(result.includes('7'));
   assert.ok(result.includes('6000'));
+  assert.ok(result.includes('12'));
   assert.ok(result.includes('300'));
   assert.ok(result.includes('end of bookmarks'));
   assert.ok(result.includes('/tmp/cache.jsonl'));

@@ -101,4 +101,6 @@ export interface BookmarkBackfillState {
   lastAdded: number;
   lastSeenIds: string[];
   stopReason?: string;
+  /** Saved pagination cursor for resuming an interrupted sync. */
+  lastCursor?: string;
 }

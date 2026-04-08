@@ -3,7 +3,9 @@ import assert from 'node:assert/strict';
 import { mkdtemp, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { buildIndex, searchBookmarks, getStats, formatSearchResults } from '../src/bookmarks-db.js';
+import { buildIndex, searchBookmarks, getStats, formatSearchResults, getBookmarkById } from '../src/bookmarks-db.js';
+import { openDb, saveDb } from '../src/db.js';
+import { twitterBookmarksIndexPath } from '../src/paths.js';
 
 const FIXTURES = [
   { id: '1', tweetId: '1', url: 'https://x.com/alice/status/1', text: 'Machine learning is transforming healthcare', authorHandle: 'alice', authorName: 'Alice Smith', syncedAt: '2026-01-01T00:00:00Z', postedAt: '2026-01-01T12:00:00Z', language: 'en', engagement: { likeCount: 100, repostCount: 10 }, mediaObjects: [], links: ['https://example.com'], tags: [], ingestedVia: 'graphql' },
@@ -31,6 +33,52 @@ test('buildIndex creates a searchable database', async () => {
     const result = await buildIndex();
     assert.equal(result.recordCount, 3);
     assert.equal(result.newRecords, 3);
+  });
+});
+
+test('buildIndex refreshes existing rows without dropping classifications', async () => {
+  await withIsolatedDataDir(async () => {
+    await buildIndex();
+
+    const dbPath = twitterBookmarksIndexPath();
+    const db = await openDb(dbPath);
+    try {
+      db.run(
+        `UPDATE bookmarks
+         SET categories = ?, primary_category = ?, domains = ?, primary_domain = ?, github_urls = ?
+         WHERE id = ?`,
+        ['ai,ml', 'research', 'example.com', 'example.com', '["https://github.com/openai/test"]', '1']
+      );
+      saveDb(db, dbPath);
+    } finally {
+      db.close();
+    }
+
+    const updatedFixtures = FIXTURES.map((fixture) =>
+      fixture.id === '1'
+        ? {
+            ...fixture,
+            text: 'Machine learning note updated',
+            bookmarkedAt: '2026-04-02T00:00:00Z',
+          }
+        : fixture
+    );
+    const jsonl = updatedFixtures.map((r) => JSON.stringify(r)).join('\n') + '\n';
+    await writeFile(path.join(process.env.FT_DATA_DIR!, 'bookmarks.jsonl'), jsonl);
+
+    const result = await buildIndex();
+    assert.equal(result.recordCount, 3);
+    assert.equal(result.newRecords, 0);
+
+    const bookmark = await getBookmarkById('1');
+    assert.ok(bookmark);
+    assert.equal(bookmark.text, 'Machine learning note updated');
+    assert.equal(bookmark.bookmarkedAt, '2026-04-02T00:00:00Z');
+    assert.deepEqual(bookmark.categories, ['ai', 'ml']);
+    assert.equal(bookmark.primaryCategory, 'research');
+    assert.deepEqual(bookmark.domains, ['example.com']);
+    assert.equal(bookmark.primaryDomain, 'example.com');
+    assert.deepEqual(bookmark.githubUrls, ['https://github.com/openai/test']);
   });
 });
 
