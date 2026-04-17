@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import './proxy.js';
 import { Command, Option } from 'commander';
 import { syncTwitterBookmarks } from './bookmarks.js';
 import { getBookmarkStatusView, formatBookmarkStatus } from './bookmarks-service.js';
