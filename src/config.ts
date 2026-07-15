@@ -11,6 +11,11 @@ export interface ChromeSessionConfig {
   browser: BrowserDef;
 }
 
+export interface XSessionCookieConfig {
+  csrfToken: string;
+  cookieHeader: string;
+}
+
 export function loadEnv(): void {
   const dir = dataDir();
   const candidatePaths = [
@@ -46,6 +51,45 @@ export function loadChromeSessionConfig(overrides: { browserId?: string } = {}):
   const profileDirectory = process.env.FT_CHROME_PROFILE_DIRECTORY ?? 'Default';
 
   return { chromeUserDataDir: dir, chromeProfileDirectory: profileDirectory, browser };
+}
+
+function validateCookieValue(name: string, value: string): void {
+  if (!value) {
+    throw new Error(`${name} must not be empty.`);
+  }
+  if (/[\r\n;]/.test(value)) {
+    throw new Error(`${name} contains invalid cookie characters.`);
+  }
+}
+
+/**
+ * Resolve X session cookies from the normal Field Theory env files.
+ * Returns undefined when neither variable is set so callers can fall back to
+ * browser extraction. A partial pair is treated as a configuration error.
+ */
+export function loadXSessionCookieConfig(): XSessionCookieConfig | undefined {
+  loadEnv();
+
+  const rawCsrfToken = process.env.FT_CT0;
+  const rawAuthToken = process.env.FT_AUTH_TOKEN;
+  const csrfToken = rawCsrfToken?.trim();
+  const authToken = rawAuthToken?.trim();
+
+  if (!csrfToken && !authToken) return undefined;
+  if (!csrfToken || !authToken) {
+    const missing = !csrfToken ? 'FT_CT0' : 'FT_AUTH_TOKEN';
+    throw new Error(
+      `Incomplete X session cookie configuration: ${missing} is missing.\n` +
+      'Set both FT_CT0 and FT_AUTH_TOKEN, or unset both to use browser extraction.'
+    );
+  }
+
+  validateCookieValue('FT_CT0', rawCsrfToken!);
+  validateCookieValue('FT_AUTH_TOKEN', rawAuthToken!);
+  return {
+    csrfToken,
+    cookieHeader: `ct0=${csrfToken}; auth_token=${authToken}`,
+  };
 }
 
 export function loadXApiConfig() {

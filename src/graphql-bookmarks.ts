@@ -1,6 +1,6 @@
 import { ensureDir, readJsonLines, writeJsonLines, readJson, writeJson, pathExists } from './fs.js';
 import { ensureDataDir, twitterBookmarksCachePath, twitterBookmarksMetaPath, twitterBackfillStatePath } from './paths.js';
-import { loadChromeSessionConfig } from './config.js';
+import { loadChromeSessionConfig, loadXSessionCookieConfig } from './config.js';
 import { extractChromeXCookies } from './chrome-cookies.js';
 import { extractFirefoxXCookies } from './firefox-cookies.js';
 import { parseTimestampMs } from './date-utils.js';
@@ -599,18 +599,24 @@ export async function syncBookmarksGraphQL(
     csrfToken = options.csrfToken;
     cookieHeader = options.cookieHeader;
   } else {
-    const config = loadChromeSessionConfig({ browserId: options.browser });
-
-    if (config.browser.cookieBackend === 'firefox') {
-      const cookies = extractFirefoxXCookies(options.firefoxProfileDir);
-      csrfToken = cookies.csrfToken;
-      cookieHeader = cookies.cookieHeader;
+    const configuredCookies = loadXSessionCookieConfig();
+    if (configuredCookies) {
+      csrfToken = configuredCookies.csrfToken;
+      cookieHeader = configuredCookies.cookieHeader;
     } else {
-      const chromeDir = options.chromeUserDataDir ?? config.chromeUserDataDir;
-      const chromeProfile = options.chromeProfileDirectory ?? config.chromeProfileDirectory;
-      const cookies = extractChromeXCookies(chromeDir, chromeProfile, config.browser);
-      csrfToken = cookies.csrfToken;
-      cookieHeader = cookies.cookieHeader;
+      const config = loadChromeSessionConfig({ browserId: options.browser });
+
+      if (config.browser.cookieBackend === 'firefox') {
+        const cookies = extractFirefoxXCookies(options.firefoxProfileDir);
+        csrfToken = cookies.csrfToken;
+        cookieHeader = cookies.cookieHeader;
+      } else {
+        const chromeDir = options.chromeUserDataDir ?? config.chromeUserDataDir;
+        const chromeProfile = options.chromeProfileDirectory ?? config.chromeProfileDirectory;
+        const cookies = extractChromeXCookies(chromeDir, chromeProfile, config.browser);
+        csrfToken = cookies.csrfToken;
+        cookieHeader = cookies.cookieHeader;
+      }
     }
   }
 
@@ -1211,6 +1217,9 @@ async function resolveFolderSyncCookies(
   if (options.csrfToken) {
     return { csrfToken: options.csrfToken, cookieHeader: options.cookieHeader };
   }
+  const configuredCookies = loadXSessionCookieConfig();
+  if (configuredCookies) return configuredCookies;
+
   const config = loadChromeSessionConfig({ browserId: options.browser });
   if (config.browser.cookieBackend === 'firefox') {
     const cookies = extractFirefoxXCookies(options.firefoxProfileDir);
@@ -1768,6 +1777,9 @@ function resolveGapFillCookies(options: SyncGapsOptions): { csrfToken?: string; 
   if (options.csrfToken) {
     return { csrfToken: options.csrfToken, cookieHeader: options.cookieHeader };
   }
+  const configuredCookies = loadXSessionCookieConfig();
+  if (configuredCookies) return configuredCookies;
+
   try {
     const config = loadChromeSessionConfig({ browserId: options.browser });
     if (config.browser.cookieBackend === 'firefox') {

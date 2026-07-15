@@ -42,6 +42,33 @@ ft stats
 
 On first run, `ft sync` extracts your X session from your browser and downloads your bookmarks into `~/.fieldtheory/bookmarks/`.
 
+### Session cookies without browser disk access
+
+If macOS blocks access to the browser cookie database, store the two X session
+cookies in Field Theory's private env file instead:
+
+```bash
+mkdir -p ~/.fieldtheory/bookmarks
+chmod 700 ~/.fieldtheory/bookmarks
+```
+
+Create `~/.fieldtheory/bookmarks/.env.local`:
+
+```dotenv
+FT_CT0=<ct0>
+FT_AUTH_TOKEN=<auth_token>
+```
+
+```bash
+chmod 600 ~/.fieldtheory/bookmarks/.env.local
+ft sync
+```
+
+Cookie precedence is `--cookies` > `FT_CT0` / `FT_AUTH_TOKEN` > browser
+extraction. Both environment variables are required as a pair. The same env
+file works no matter whether `ft` is launched from Terminal, an IDE, or an
+agent, so those applications do not need Full Disk Access.
+
 ## Commands
 
 ### Sync
@@ -294,7 +321,7 @@ Session sync extracts cookies from your browser's local database. Use `ft sync -
 
 **Your data stays local.** No telemetry, no analytics, nothing phoned home. The CLI only makes network requests to X's API during sync.
 
-**Chrome session sync** reads cookies from Chrome's local database, uses them for the sync request, and discards them. Cookies are never stored separately.
+**Browser session sync** reads cookies from the browser's local database, uses them for the sync request, and discards them. If you opt into `FT_CT0` / `FT_AUTH_TOKEN`, the cookies remain in your owner-only `.env.local` file instead; treat that file like a password and keep it at mode `600`.
 
 **OAuth tokens** are stored with `chmod 600` (owner-only). Treat `~/.fieldtheory/bookmarks/oauth-token.json` like a password.
 

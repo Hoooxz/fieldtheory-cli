@@ -344,6 +344,7 @@ function parseNavigationPlace(value: string): NavigationPlace {
 // ── Update checker ────────────────────────────────────────────────────────
 
 const UPDATE_CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000; // 1 day
+const PERSONAL_BUILD_SUFFIX = 'hoooxz.1';
 
 function getLocalVersion(): string {
   try {
@@ -353,6 +354,10 @@ function getLocalVersion(): string {
   } catch {
     return '0.0.0';
   }
+}
+
+function getDisplayVersion(): string {
+  return `${getLocalVersion()}-${PERSONAL_BUILD_SUFFIX}`;
 }
 
 export function compareVersions(a: string, b: string): number {
@@ -485,7 +490,7 @@ function showWhatsNew(): void {
 }
 
 function logo(): string {
-  const v = getLocalVersion();
+  const v = getDisplayVersion();
   const vLabel = `v${v}`;
   const innerW = 33;
   const line1 = 'F i e l d   T h e o r y';
@@ -814,7 +819,7 @@ export function buildCli() {
   program
     .name('ft')
     .description('Self-custody for your X/Twitter bookmarks. Sync, search, classify, and explore locally.')
-    .version(getLocalVersion())
+    .version(getDisplayVersion())
     .showHelpAfterError()
     .hook('preAction', (_thisCommand, actionCommand) => {
       if (shouldSkipCommandChrome(actionCommand)) return;
@@ -841,7 +846,7 @@ export function buildCli() {
     .option('--delay-ms <n>', 'Delay between requests in ms', (v: string) => Number(v), 600)
     .option('--max-minutes <n>', 'Max runtime in minutes', (v: string) => Number(v), 30)
     .option('--browser <name>', 'Browser to read session from (chrome, chromium, brave, firefox, ...)')
-    .option('--cookies <values...>', 'Pass ct0 and auth_token directly (skips browser extraction)')
+    .option('--cookies <values...>', 'Pass ct0 and auth_token directly (overrides FT_CT0/FT_AUTH_TOKEN)')
     .option('--chrome-user-data-dir <path>', 'Chrome-family user-data directory')
     .option('--chrome-profile-directory <name>', 'Chrome-family profile name')
     .option('--firefox-profile-dir <path>', 'Firefox profile directory')
